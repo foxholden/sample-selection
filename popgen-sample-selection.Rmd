@@ -1,0 +1,549 @@
+---
+title: "TurboSampler9000"
+author: "Holden"
+date: "2025-07-08"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = "/Users/holdenfox/Desktop/shrike-gen/map")
+```
+
+Howdy folks!
+
+Often in population genomics projects you end up with more genetic samples than you can actually sequence. And it can actually be kinda tricky, or at least time-consuming, to decide which samples to include on a sequencing lane and which ones to drop. I struggle with this a bunch, especially when working with data from many different sources, somewhat randomly sampled, across large time-scales, and including various tissue types and dna quality. But it is important to make smart choices for what to sequence, so that you maximize the potential use of the genomic data generated. That's why I am creating a set of tools to provide a robust system for ranking genomic samples based on their geographic distance, sample type (associated w/ dna quality), and age. The goal here is to prioritize and automate selecting samples that can form viable clusters for analysis of population structure, genotype-environment associations, and more.
+
+```{r, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(geosphere)
+library(dbscan)
+library(rnaturalearth)
+library(rnaturalearthdata)
+library(sf)
+```
+
+Ok so the primary criteria for ranking samples probably ought to be based on geographic distance. So let's start with that. Whatever the state of your metadata, you should probably have a column with the latitude and longitude of each sample.
+
+I'm going to use a combined metadata sheet for shrikes for testing. The important information that should be complete are the cooridnates (lat, long), sample type (I have a variety of sample types to choose from), and an ID.
+```{r, message=FALSE, warning=FALSE}}
+meta <- read_csv("../complete-winter-shrike-metadata/winter_metadata_feathers_and_blood.csv")
+
+meta <- meta %>% filter(!is.na(Lat) & !is.na(Long))
+
+# let's get rid of the Susan Heath wintering shrike samples that all but one turned out to be residents.
+meta <- meta %>% filter(Contact != "Susan Heath")
+
+# extract coordinates
+coords <- meta %>% dplyr::select(Long, Lat)
+
+# calculate distance matrix using Haversine distance
+dist_matrix <- distm(as.matrix(coords), fun = distHaversine)
+
+# clustering
+hclust_groups <- hclust(as.dist(dist_matrix), method = "complete") # complete method here avoids chaining, ensuring all samples in a cluster are within the specified distance of each other. If you want some flexibility you could try "average"
+
+# cut tree at 111.111 km to assign spatial clusters
+meta$GroupID <- cutree(hclust_groups, h = 111111)
+
+# create population labels and filter for minimum cluster size
+meta <- meta %>%
+  mutate(Pop = paste0("Cluster_", GroupID)) %>%
+  group_by(Pop) %>%
+  filter(n() > 3) %>%  # keep only clusters with ≥4 individuals
+  ungroup()
+
+# summary statistics
+cat("Clustering Results:\n")
+cat("Number of clusters with ≥4 individuals:", length(unique(meta$Pop)), "\n")
+cat("Total individuals retained:", nrow(meta), "\n")
+
+# cluster size distribution
+cluster_sizes <- meta %>%
+  group_by(Pop) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  arrange(desc(n))
+
+print(cluster_sizes)
+```
+
+Map it so we can visualize where the samples are
+```{r}
+# import base map
+library(plotly)
+map <- ne_states(country = c("United States of America", "Mexico"), returnclass = 'sf')
+
+# import shrike range from ebird
+shrike_range <- st_read("/Users/holdenfox/Desktop/shrike-gen/meta/logshr_range_2022/logshr_range_2022.gpkg") %>%
+  filter(season == "nonbreeding") %>%
+  st_set_crs(4326)
+
+# create colors for clusters
+n_clusters <- length(unique(meta$Pop))
+cluster_colors <- rainbow(n_clusters)
+names(cluster_colors) <- unique(meta$Pop)
+
+meta <- meta %>%
+  group_by(Pop) %>%
+  mutate(cluster_size = n()) %>%
+  ungroup()
+
+# plot it
+p <- ggplot() +
+  geom_sf(data = map, fill = "white", color = "black", size = 0.1) +
+  geom_sf(data = shrike_range, fill = "grey", color = NA, alpha = 0.5) +
+  geom_point(data = meta, aes(x = Long, 
+                              y = Lat, 
+                              color = Pop,
+                              text = paste0(
+                                "ID: ", SampleID, "<br>",
+                                "Cluster: ", Pop, "<br>",
+                                "Cluster Size: ", cluster_size, "<br>",
+                                "Sequenced: ", Sequenced, "<br>",
+                                "SampleType: ", SampleType, "<br>",
+                                "CollectionDate: ", CollectionDate, "<br>")), 
+             size = 2, position = position_jitter(width = 0.1, height = 0.1)) +
+  scale_colour_manual(values = cluster_colors, name = "Spatial Clusters", guide = "none") +
+  coord_sf(xlim = c(-140, -65), ylim = c(15, 50)) + 
+  theme_minimal() +
+  labs(title = "All clusters with >4 individuals",
+       x = "Longitude",
+       y = "Latitude")
+
+
+ggplotly(p, tooltip = "text")
+```
+
+I've been referencing the map and filtering out clusters to dedensify certain parts of the sample distribution in order to increase the sample number per cluster given a strict budget. I've kinda been doing this manually. That takes place here.
+```{r}
+meta <- left_join(meta, cluster_sizes, by = "Pop") %>% 
+  filter(!Pop %in% c("Cluster_18", "Cluster_31", "Cluster_34", "Cluster_36", "Cluster_37", "Cluster_51", "Cluster_61","Cluster_70", "Cluster_14", "Cluster_32", "Cluster_35", "Cluster_33", "Cluster_15", "Cluster_52"))
+```
+
+Here will be a function to pick the number of samples you should select based on the number of lanes you have available and the target depth you want to achieve. Holden use your post rmdup coverage to fill this in.
+```{r}
+
+```
+
+Ok so now the ranking and selection portion...
+```{r}
+# Step 1: Define sample type ranking hierarchy
+# give lower quality samples a lower rank
+sample_type_ranking <- data.frame(
+  SampleType = c("Blood", "Blood, Feather", "DNA", "DNA, Feather", "Feather", "Toe pad"),
+  type_rank = c(1, 1, 2, 3, 4, 5),  # 1 = highest priority (Blood and Blood,Feather treated same)
+  stringsAsFactors = FALSE
+)
+
+# Step 2: Determine the age of the sample based on the collection date. Newer samples will get a higher priority.
+# This should be able to handle multiple Date formats
+calculate_age <- function(collection_date, reference_date = Sys.Date()) {
+  if (is.na(collection_date) || collection_date == "") return(NA)
+  
+  # convert to date if it's a string
+  if (is.character(collection_date)) {
+    # try a couple of different formats
+    parsed_date <- tryCatch({
+      # M/D/YYYY
+      as.Date(collection_date, format = "%m/%d/%Y")
+    }, error = function(e) {
+      tryCatch({
+        # M/D/YY
+        as.Date(collection_date, format = "%m/%d/%y")
+      }, error = function(e) {
+        tryCatch({
+          as.Date(collection_date)
+        }, error = function(e) {
+          return(NA)
+        })
+      })
+    })
+    
+    collection_date <- parsed_date
+  }
+  
+  if (is.na(collection_date)) return(NA)
+  
+  # get the age in years
+  age_years <- as.numeric(difftime(reference_date, collection_date, units = "days")) / 365.25
+  return(age_years)
+}
+
+# Step 3: Rank samples, give already sequenced samples the highest priority
+rank_samples <- function(meta, 
+                        sample_type_col = "SampleType", 
+                        date_col = "CollectionDate",
+                        sequenced_col = "Sequenced",
+                        prefer_recent = TRUE) {
+  
+  # add sample type ranking
+  meta <- meta %>%
+    left_join(sample_type_ranking, by = setNames("SampleType", sample_type_col)) %>%
+    mutate(
+      # if sample type not found in ranking, assign lowest priority maybe change this, b/c atm YOU MUST HAVE SAMPLE TYPE INFORMATION TO RANK AND EFFECTIVELY CHOOSE SAMPLES
+      type_rank = ifelse(is.na(type_rank), max(sample_type_ranking$type_rank) + 1, type_rank)
+    )
+  
+  # rank by age
+  meta <- meta %>%
+    mutate(
+      age_years = sapply(get(date_col), calculate_age),
+      # prefer recent samples 
+      age_rank = if (prefer_recent) {
+        rank(age_years, ties.method = "min", na.last = TRUE)
+      } else {
+        rank(-age_years, ties.method = "min", na.last = FALSE)
+      }
+    )
+  
+  # within each cluster, 
+  meta <- meta %>%
+    group_by(Pop) %>%
+    mutate(
+      # check if already sequenced
+      is_sequenced = ifelse(is.na(get(sequenced_col)), FALSE, 
+                           toupper(get(sequenced_col)) == "Y"),
+      
+      # create composite rank
+      # already sequenced samples get rank 0-999, others get 1000+
+      composite_rank = ifelse(is_sequenced, 
+                             age_rank,  # Just age rank for sequenced samples (0-999)
+                             type_rank * 1000 + age_rank),  # Type + age for unsequenced (1000+)
+      
+      cluster_rank = rank(composite_rank, ties.method = "min")
+    ) %>%
+    ungroup()
+  
+  return(meta)
+}
+
+# Step 4: Actually select samples
+select_samples <- function(ranked_meta, 
+                           max_samples_per_cluster = 8,
+                           min_samples_per_cluster = 4,
+                           total_budget = NULL) {
+  
+  # always select ALL sequenced samples first (these will always be included)
+  sequenced_samples <- ranked_meta %>%
+    filter(is_sequenced == TRUE)
+  
+  cat("Selected", nrow(sequenced_samples), "\n")
+  
+  # calculate remaining budget for unsequenced samples
+  remaining_budget <- if (!is.null(total_budget)) {
+    max(0, total_budget - nrow(sequenced_samples))
+  } else {
+    NULL
+  }
+  
+  if (!is.null(total_budget)) {
+    cat("Remaining budget:", remaining_budget, "\n")
+  }
+  
+  #select unsequenced samples between min and max allowed
+  unsequenced_candidates <- ranked_meta %>%
+    filter(is_sequenced == FALSE)
+  
+  if (nrow(unsequenced_candidates) == 0) {
+    cat("No unsequenced samples available\n")
+    return(sequenced_samples)
+  }
+  
+  # initial selection of unsequenced samples by cluster
+  unsequenced_selected <- unsequenced_candidates %>%
+    group_by(Pop) %>%
+    arrange(cluster_rank) %>%
+    slice_head(n = max_samples_per_cluster) %>%
+    ungroup()
+  
+    # account for sequenced samples in max_samples_per_cluster limit
+  sequenced_per_cluster <- sequenced_samples %>%
+    count(Pop, name = "sequenced_count")
+  
+  unsequenced_selected <- unsequenced_selected %>%
+    left_join(sequenced_per_cluster, by = "Pop") %>%
+    mutate(sequenced_count = replace_na(sequenced_count, 0)) %>%
+    group_by(Pop) %>%
+    mutate(row_num = row_number()) %>%
+    # keep only rows where row number <= allowed unsequenced samples for this cluster
+    filter(row_num <= pmax(0, max_samples_per_cluster - sequenced_count)) %>%
+    select(-sequenced_count, -row_num) %>%
+    ungroup()
+  
+  # combine sequenced and unsequenced before checking min cluster sizes
+  all_selected <- bind_rows(sequenced_samples, unsequenced_selected)
+  
+  # check ifmin cluster size is met
+  cluster_sizes <- all_selected %>%
+    count(Pop, name = "selected_count")
+  
+  clusters_below_min <- cluster_sizes %>%
+    filter(selected_count < min_samples_per_cluster) %>%
+    pull(Pop)
+  
+  if (length(clusters_below_min) > 0) {
+    cat("Removing", length(clusters_below_min), "clusters with fewer than", min_samples_per_cluster, "samples:\n")
+    print(clusters_below_min)
+    
+    # remove unsequenced samples from clusters below the min
+    # sequenced samples are always kept
+    unsequenced_selected <- unsequenced_selected %>%
+      filter(!Pop %in% clusters_below_min)
+    
+    # update combined selection
+    all_selected <- bind_rows(sequenced_samples, unsequenced_selected)
+  }
+  
+  # apply budget constraint to unsequenced samples only
+  if (!is.null(remaining_budget) && nrow(unsequenced_selected) > remaining_budget) {
+    
+    samples_to_remove <- nrow(unsequenced_selected) - remaining_budget
+    cat("Need to remove", samples_to_remove, "unsequenced samples\n")
+    
+    removed_count <- 0
+    
+    while (removed_count < samples_to_remove && nrow(unsequenced_selected) > 0) {
+      
+      # count current samples per cluster
+      current_cluster_sizes <- bind_rows(sequenced_samples, unsequenced_selected) %>%
+        count(Pop, name = "total_count")
+      
+      # find cluster with most total samples that can lose unsequenced samples
+      clusters_with_unsequenced <- unsequenced_selected %>%
+        count(Pop, name = "unsequenced_count") %>%
+        left_join(current_cluster_sizes, by = "Pop") %>%
+        # only remove if cluster will still meet minimum after removal
+        filter(total_count > min_samples_per_cluster) %>%
+        arrange(desc(total_count)) %>%
+        slice_head(n = 1) %>%
+        pull(Pop)
+      
+      if (length(clusters_with_unsequenced) == 0) {
+        cat("Unable to remove more unsequenced samples while maintaining minimum cluster size\n")
+        break
+      }
+      
+      target_cluster <- clusters_with_unsequenced[1]
+      
+      # remove the worst ranked unsequenced sample
+      sample_to_remove <- unsequenced_selected %>%
+        filter(Pop == target_cluster) %>%
+        arrange(desc(cluster_rank)) %>%
+        slice_head(n = 1)
+      
+      unsequenced_selected <- unsequenced_selected %>%
+        filter(SampleID != sample_to_remove$SampleID)
+      
+      removed_count <- removed_count + 1
+    }
+    
+    cat("Removed", removed_count, "unsequenced samples\n")
+  }
+  
+  # combine sequenced + selected unsequenced
+  selected_samples <- bind_rows(sequenced_samples, unsequenced_selected)
+
+  
+  return(selected_samples)
+}
+
+
+
+### USE RANKING AND SELCTION FUNCTION HERE
+
+# Notes 
+# 40 samples have already been sequenced, so number to select is total_budget - 40. I don't have the metadata for the samples Amanda and I collected, there are like 4 in Colorado and like 7 in Utah i believe? We should include all the CO ones and at leat 5 of the Utah ones. Doesn't matter which as long as they cluster together...
+
+# apply ranking
+ranked_meta <- rank_samples(meta, 
+                           sample_type_col = "SampleType",  
+                           date_col = "CollectionDate",     
+                           sequenced_col = "Sequenced",     
+                           prefer_recent = TRUE)
+
+# select samples
+selected_samples <- select_samples(ranked_meta, 
+                                  max_samples_per_cluster = 8, # max number of samples per cluster
+                                  min_samples_per_cluster = 4, # min number of samples per cluster
+                                  total_budget = 230)  # total number of samples to select
+
+write_csv(selected_samples, "LOSH_Winter_Library_Selection_JUL25.csv")
+
+# selected samples including already sequenced by cluster
+cluster_summary <- selected_samples %>%
+  group_by(Pop) %>%
+  summarise(
+    selected_count = n(),
+    available_count = first(n()),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(selected_count))
+
+print(cluster_summary)
+
+```
+
+Visualize it
+```{r}
+library(plotly)
+
+selected_samples <- selected_samples %>%
+  group_by(Pop) %>%
+  mutate(cluster_size = n()) %>%
+  ungroup()
+
+# plot it
+p <- ggplot() +
+  geom_sf(data = map, fill = "white", color = "black", size = 0.2) +
+  geom_sf(data = shrike_range, fill = "grey", color = NA, alpha = 0.5) +
+  geom_point(data = selected_samples, aes(x = Long, 
+                              y = Lat, 
+                              color = Pop,
+                              text = paste0(
+                                "ID: ", SampleID, "<br>",
+                                "Cluster: ", Pop, "<br>",
+                                "Cluster Size: ", cluster_size, "<br>",
+                                "Sequenced: ", Sequenced, "<br>",
+                                "CollectionDate: ", CollectionDate, "<br>")), 
+             size = 2, position = position_jitter(width = 0.3, height = 0.3)) +
+  scale_colour_manual(values = cluster_colors, name = "Spatial Clusters", guide = "none") +
+  coord_sf(xlim = c(-140, -65), ylim = c(15, 50)) +  # Using your original study area bounds
+  theme_minimal() +
+  labs(title = "Selected Samples",
+       x = "Longitude",
+       y = "Latitude")
+
+
+ggplotly(p, tooltip = "text")
+```
+
+
+###############################################################################################################
+
+###alternate selection function
+
+This doesn't work correctly yet.
+```{r}
+select_samples <- function(ranked_meta, 
+                           max_samples_per_cluster = 8,
+                           min_samples_per_cluster = 4,
+                           total_budget = NULL) {
+  
+  
+  sequenced_samples <- ranked_meta %>%
+    filter(is_sequenced == TRUE)
+  
+  cat("Selected", nrow(sequenced_samples), "sequenced samples (always included)\n")
+  
+  
+  remaining_budget <- if (!is.null(total_budget)) {
+    max(0, total_budget - nrow(sequenced_samples))
+  } else {
+    NULL
+  }
+  
+  if (!is.null(total_budget)) {
+    cat("Remaining budget for unsequenced samples:", remaining_budget, "\n")
+  }
+  
+  
+  unsequenced_candidates <- ranked_meta %>%
+    filter(is_sequenced == FALSE)
+  
+  if (nrow(unsequenced_candidates) == 0) {
+    cat("No unsequenced samples available\n")
+    return(sequenced_samples)
+  }
+  
+  
+  sequenced_per_cluster <- sequenced_samples %>%
+    count(Pop, name = "sequenced_count")
+  
+  unsequenced_per_cluster <- unsequenced_candidates %>%
+    count(Pop, name = "unsequenced_count")
+  
+  cluster_potential <- unsequenced_per_cluster %>%
+    left_join(sequenced_per_cluster, by = "Pop") %>%
+    mutate(sequenced_count = replace_na(sequenced_count, 0)) %>%
+    mutate(total_potential = sequenced_count + unsequenced_count) %>%
+    filter(total_potential >= min_samples_per_cluster)
+  
+  valid_clusters <- cluster_potential$Pop
+  cat("Keeping", length(valid_clusters), "clusters that can meet minimum size requirement\n")
+  
+  
+  unsequenced_candidates <- unsequenced_candidates %>%
+    filter(Pop %in% valid_clusters)
+  
+  if (nrow(unsequenced_candidates) == 0) {
+    cat("No valid unsequenced candidates after cluster filtering\n")
+    return(sequenced_samples)
+  }
+  
+  
+  selected_unsequenced <- data.frame()
+  
+  
+  current_per_cluster <- sequenced_samples %>%
+    filter(Pop %in% valid_clusters) %>%
+    count(Pop, name = "current_count")
+  
+  
+  missing_clusters <- setdiff(valid_clusters, current_per_cluster$Pop)
+  if (length(missing_clusters) > 0) {
+    current_per_cluster <- bind_rows(
+      current_per_cluster,
+      data.frame(Pop = missing_clusters, current_count = 0)
+    )
+  }
+  
+  
+  samples_selected <- 0
+  max_iterations <- if (!is.null(remaining_budget)) remaining_budget else nrow(unsequenced_candidates)
+  
+  while (samples_selected < max_iterations && nrow(unsequenced_candidates) > 0) {
+    
+    
+    available_clusters <- current_per_cluster %>%
+      filter(current_count < max_samples_per_cluster) %>%
+      pull(Pop)
+    
+    if (length(available_clusters) == 0) {
+      cat("All clusters have reached maximum sample limit\n")
+      break
+    }
+    
+    
+    best_sample <- unsequenced_candidates %>%
+      filter(Pop %in% available_clusters) %>%
+      arrange(cluster_rank) %>%
+      slice_head(n = 1)
+    
+    if (nrow(best_sample) == 0) break
+    
+    
+    selected_unsequenced <- bind_rows(selected_unsequenced, best_sample)
+    
+    
+    cluster_pop <- best_sample$Pop
+    current_per_cluster <- current_per_cluster %>%
+      mutate(current_count = ifelse(Pop == cluster_pop, current_count + 1, current_count))
+    
+    
+    unsequenced_candidates <- unsequenced_candidates %>%
+      filter(SampleID != best_sample$SampleID)
+    
+    samples_selected <- samples_selected + 1
+    
+    if (samples_selected %% 50 == 0) {
+      cat("Selected", samples_selected, "unsequenced samples\n")
+    }
+  }
+  
+  
+  selected_samples <- bind_rows(sequenced_samples, selected_unsequenced)
+  
+  return(selected_samples)
+}
+
+
+```
