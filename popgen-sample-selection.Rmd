@@ -1,5 +1,5 @@
 ---
-title: "TurboSampler9000"
+title: "PopGen Sample Selection"
 author: "Holden"
 date: "2025-07-08"
 output: html_document
