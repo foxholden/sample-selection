@@ -205,8 +205,8 @@ rank_samples <- function(meta,
       # create composite rank
       # already sequenced samples get rank 0-999, others get 1000+
       composite_rank = ifelse(is_sequenced, 
-                             age_rank,  # Just age rank for sequenced samples (0-999)
-                             type_rank * 1000 + age_rank),  # Type + age for unsequenced (1000+)
+                             age_rank,  # just age rank for sequenced samples (0-999)
+                             type_rank * 1000 + age_rank),  # type + age for unsequenced (1000+)
       
       cluster_rank = rank(composite_rank, ties.method = "min")
     ) %>%
@@ -221,13 +221,13 @@ select_samples <- function(ranked_meta,
                            min_samples_per_cluster = 4,
                            total_budget = NULL) {
   
-  # always select ALL sequenced samples first (these will always be included)
+  # always select all sequenced samples firt
   sequenced_samples <- ranked_meta %>%
     filter(is_sequenced == TRUE)
   
   cat("Selected", nrow(sequenced_samples), "\n")
   
-  # calculate remaining budget for unsequenced samples
+  # calculate the remaining budget for unsequenced samples
   remaining_budget <- if (!is.null(total_budget)) {
     max(0, total_budget - nrow(sequenced_samples))
   } else {
@@ -254,7 +254,7 @@ select_samples <- function(ranked_meta,
     slice_head(n = max_samples_per_cluster) %>%
     ungroup()
   
-    # account for sequenced samples in max_samples_per_cluster limit
+  # account for sequenced samples in max_samples_per_cluster limit
   sequenced_per_cluster <- sequenced_samples %>%
     count(Pop, name = "sequenced_count")
   
